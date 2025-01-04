@@ -1,9 +1,26 @@
 
+# The `environment.yml` file is used to manage and reproduce conda environments.
+# 
+# To create this file from your current conda environment:
+# 1. Run `conda env export > environment.yml` in your terminal. This command exports
+#    the specifications of the active conda environment to an `environment.yml` file.
+# 
+# To recreate the environment from an `environment.yml` file:
+# 1. Run `conda env create -f environment.yml`. This will create a new conda environment
+#    with the exact dependencies listed in the file.
+# 
+# Note: If the environment already exists and you want to update it, use:
+#    `conda env update -f environment.yml`.
+
+
 import numpy as np
 from scipy.stats import ttest_rel, shapiro, wilcoxon
 from statsmodels.stats.power import TTestPower, NormalIndPower
 from scipy.stats import rankdata
+import warnings
 
+# Suppress all warnings
+warnings.filterwarnings("ignore")
 
 def paired_t_test(x, y, alpha=0.05):
     """
@@ -206,3 +223,5 @@ gaitSpeed = {
     }
 }
 results = compare_twodata(gaitSpeed, 'gaitSpeed')
+
+
