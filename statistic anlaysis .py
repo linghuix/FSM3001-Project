@@ -3,7 +3,7 @@ import pandas as pd
 from scipy import stats
 from scipy.stats import jarque_bera
 from scipy.stats import levene
-
+from statsmodels.stats.power import TTestPower
 
 def levene_test(*groups, alpha = 0.05):
     """
@@ -173,30 +173,51 @@ def kruskal_wallis_with_posthoc(*groups):
 
 def one_sample_t_test(data, test_value=0, alpha=0.05):
     """
-    Perform a one-sample t-test to check if the sample mean is equal to a given value (test_value).
-    
+    Perform a one-sample t-test to check if the sample mean is equal to a given value (test_value),
+    and calculate the statistical power of the test. Also checks for normality of the data.
+
     Parameters:
     - data: Sample data (array-like).
     - test_value: The value to compare the sample mean to (default is 0).
     - alpha: Significance level (default is 0.05).
-    
-    Returns:
-    - t_stat: The t-statistic.
-    - p_value: The two-tailed p-value for the test.
-    - reject_null: Boolean indicating whether the null hypothesis is rejected.
-    """
-    import numpy as np
-    from scipy import stats
 
+    Returns:
+    - dict: A dictionary containing the t-statistic, p-value, reject_null, power, and normality test result.
+    """
+    # Calculate the sample mean and standard deviation
+    sample_mean = np.mean(data)
+    sample_std = np.std(data, ddof=1)
+    n = len(data)
+    
     # Perform one-sample t-test (default is two-tailed)
     t_stat, p_value = stats.ttest_1samp(data, test_value)
     
     # Determine if we reject the null hypothesis
     reject_null = p_value < alpha
     
-    return t_stat, p_value, reject_null
-
-
+    # Calculate the effect size (Cohen's d)
+    effect_size = (sample_mean - test_value) / sample_std
+    
+    # Perform power analysis using statsmodels
+    power_analysis = TTestPower()
+    power = power_analysis.solve_power(effect_size=effect_size, nobs=n, alpha=alpha, alternative='two-sided')
+    
+    # Perform normality check using Shapiro-Wilk test
+    normality_stat, normality_p_value = stats.shapiro(data)
+    normality_passed = normality_p_value > alpha  # Normality assumption is passed if p > alpha
+    
+    # Return results as a dictionary
+    results = {
+        "t_stat": t_stat,
+        "p_value": p_value,
+        "reject_null": reject_null,
+        "power": power,
+        "normality_stat": normality_stat,
+        "normality_p_value": normality_p_value,
+        "normality_passed": normality_passed
+    }
+    
+    return results
 
 def perform_t_test(group_1, group_2, paired=False):
     """
@@ -236,6 +257,10 @@ def perform_ANOVA_tests(*groups):
     
     Prints the results of normality tests, Levene's test, Bartlett's test, ANOVA with post hoc, and Kruskal-Wallis with post hoc.
     """
+
+    import pingouin as pg
+    import pandas as pd
+    import scipy.stats as stats
     
     print('-----------------------------------------')
     # Normality tests for each group
@@ -269,199 +294,344 @@ def perform_ANOVA_tests(*groups):
     print('Kruskal-Wallis test ')
     result = kruskal_wallis_with_posthoc(*groups)
     print(result)
+
+
+    # Repeated Measures ANOVA and Post Hoc for the given groups
+    print('## Repeated Measures ANOVA with Post Hoc Comparisons')
+    
+    # Ensure all groups are of the same length (number of subjects)
+    num_subjects = len(groups[0])  # Assuming all groups have the same number of subjects
+    for i, group in enumerate(groups, 1):
+        if len(group) != num_subjects:
+            print(f"Warning: Group {i} does not have the same number of subjects. Skipping repeated measures ANOVA.")
+            return
+
+    # Create a long-format DataFrame for the repeated measures ANOVA
+    subjects = list(range(1, num_subjects + 1))  # Subject identifiers (1 to n)
+    conditions = [f'Condition_{i}' for i in range(1, len(groups) + 1)]  # Create condition names (Condition_1, Condition_2, etc.)
+
+    # Creating a long-format DataFrame where each row is a subject's score under a condition
+    data = pd.DataFrame({
+        'Subject': subjects * len(groups),  # Repeating subjects for each condition
+        'Condition': [condition for condition in conditions for _ in range(num_subjects)],  # Repeating conditions for each subject
+        'Score': [score for group in groups for score in group]  # Flatten the groups into a single list
+    })
+
+    # Perform Repeated Measures ANOVA using pingouin
+    anova = pg.rm_anova(dv='Score', within='Condition', subject='Subject', data=data, detailed=True)
+
+    # Test for sphericity
+    mauchly = pg.sphericity(data=data, dv='Score', within='Condition', subject='Subject')
+    print("Test for sphericity:")
+    print(mauchly)
+
+    # Print ANOVA results
+    print("ANOVA Results:")
+    print(anova)
+
+    # Perform post hoc comparisons (pairwise t-tests) with Bonferroni correction
+    post_hoc = pg.pairwise_tests(dv='Score', within='Condition', subject='Subject', data=data, padjust='bonferroni')
+
+    # Print post hoc comparison results
+    print("\nPost Hoc Comparisons (with Bonferroni correction):")
+    print(post_hoc)
+
+    print("-----------------------------------------")
     print("-----------------------------------------")
 
 
+import numpy as np
+import pandas as pd
+import pingouin as pg
+from scipy.stats import shapiro
+from statsmodels.stats.anova import AnovaRM
+from pingouin import sphericity
+from pingouin import sphericity, pairwise_ttests, power_rm_anova
+
+def one_factor_repeated_anova(*groups):
+    """
+    Perform a one-factor repeated measures ANOVA with assumption checks.
+
+    Parameters:
+        *groups: Variable number of arrays or lists representing repeated measures data.
+
+    Returns:
+        Dictionary with results of assumption checks and ANOVA summary.
+    """
+    # Check input consistency
+    if len(groups) < 2:
+        raise ValueError("At least two groups are required for repeated measures ANOVA.")
+
+    n_subjects = len(groups[0])
+    if not all(len(group) == n_subjects for group in groups):
+        raise ValueError("All groups must have the same number of observations (balanced design).")
+
+    # Convert data into a long-form DataFrame
+    data = pd.DataFrame({f"Group_{i+1}": group for i, group in enumerate(groups)})
+    data["Subject"] = np.arange(1, n_subjects + 1)
+    data_long = data.melt(id_vars="Subject", var_name="Condition", value_name="Score")
+
+    # Check for normality (Shapiro-Wilk test for each group)
+    normality_results = {col: shapiro(data[col]).pvalue for col in data.columns if col != "Subject"}
+    normality_passed = all(p > 0.05 for p in normality_results.values())
+
+    # Check for sphericity (Mauchly's test using Pingouin)
+    sphericity_res = sphericity(data_long, dv="Score", subject="Subject", within="Condition")
+    sphericity_passed = sphericity_res.pval > 0.05;
+
+    # Perform repeated measures ANOVA
+    anova_results = pg.rm_anova(data=data_long, dv="Score", within="Condition", subject="Subject")
+
+    # Perform post hoc analysis (pairwise comparisons)
+    post_hoc_results = pg.pairwise_ttests(
+        data=data_long,
+        dv="Score",
+        within="Condition",
+        subject="Subject",
+        padjust="bonferroni"  # Use Bonferroni correction for multiple comparisons
+    )
+
+    # Power analysis for each post hoc comparison
+    power_results = []
+    power_analysis = TTestPower()
+
+    for index, row in post_hoc_results.iterrows():
+        # Calculate Cohen's d for each comparison using t-statistic and sample size
+        t_stat = row['T']
+        effect_size_d = t_stat / np.sqrt(n_subjects)
+        
+        # Perform power analysis using the Cohen's d for each pairwise comparison
+        power = power_analysis.solve_power(effect_size=effect_size_d, nobs=n_subjects, alpha=0.05)
+        
+        power_results.append({
+            "Contrast": f"{row['A']} vs {row['B']}",
+            "T-statistic": t_stat,
+            "Effect Size (Cohen's d)": effect_size_d,
+            "Power": power
+        })
+
+    # Return results
+    return {
+        "Normality Results (Shapiro-Wilk)": normality_results,
+        "Normality Passed": normality_passed,
+        "Sphericity Test (Mauchly)": {
+            "p-value": sphericity_res.pval,
+            "Passed": sphericity_passed
+        },
+        "ANOVA Summary": anova_results,
+        "Post Hoc Results": post_hoc_results,
+        "power_results": power_results,
+    }
+
 ### Defining the "More Affected Midstance" values for each mode (Stance & Swing, Stance, Swing)
-print('## assistance mode effect on knee extension angle of More Affected side in Midstance')
+print('## repeated ANOVA assistance mode effect on knee extension angle of More Affected side in Midstance')
 stanceswing = [0.5, 8.0, 8.2, 9.3, 11.0, 19.5, 36.7]    # Stance & Swing
 stance = [-5.3, 1.4, 8.1, 8.9, 6.2, 17.1, 18.4]         # Stance
 swing = [-8.8, 2.5, 5.7, 1.4, -2.5, 5.1, 7.6]           # Swing
-perform_ANOVA_tests(stanceswing, stance, swing)
+# perform_ANOVA_tests(stanceswing, stance, swing)
 
+res = one_factor_repeated_anova(stanceswing, stance, swing)
+print(res)
 
-# Reduction in Crouch: θ Initial Contact (°) More Affected
+# # Reduction in Crouch: θ Initial Contact (°) More Affected
 print('## assistance mode effect on knee extension angle of More Affected side in Initial Contact')
 stanceswing = [0.4,7.3,3.3,5.4,10.7,8.5,11.7]   # Stance & Swing
 stance = [-1.9,2.8,1.8,0.9,-0.5,6.0,0.3]        # Stance
 swing = [-12.5,11.8,-2.6,3.9,5.7,15.6,10.6]     # Swing
-perform_ANOVA_tests(stanceswing, stance, swing)
+#perform_ANOVA_tests(stanceswing, stance, swing)
+res = one_factor_repeated_anova(stanceswing, stance, swing)
+print(res)
 
-
-# Reduction in Crouch: θ Initial Contact (°) less affected
+# # Reduction in Crouch: θ Initial Contact (°) less affected
 print('## assistance mode effect on knee extension angle of Less Affected side in Initial Contact')
 stanceswing = [0.5,10.2,2.8,6.7,-2.1,8.8,19.3]   # Stance & Swing
 stance = [-7.3,-4.3,-3.3,1.9,-11.0,1.9,-0.7]        # Stance
 swing = [-6.7,6.1,3.8,10.8,-0.5,5.6,10.9,]     # Swing
-perform_ANOVA_tests(stanceswing, stance, swing)
+# perform_ANOVA_tests(stanceswing, stance, swing)
+res = one_factor_repeated_anova(stanceswing, stance, swing)
+print(res)
 
-# Reduction in Crouch: θ Midstance (°) less affected
+
+# # Reduction in Crouch: θ Midstance (°) less affected
 print('## assistance mode effect on knee extension angle of Less Affected side in Midstance')
 stanceswing = [-6.2,5.2,5.6,8.9,8.6,6.9,11.5]   # Stance & Swing
 stance = [-7.6,2.0,6.0,15.0,7.1,5.0,15.3]        # Stance
 swing = [-12.4,5.2,-7.6,3.5,-2.3,-0.4,2.7]     # Swing
-perform_ANOVA_tests(stanceswing, stance, swing)
+# perform_ANOVA_tests(stanceswing, stance, swing)
+res = one_factor_repeated_anova(stanceswing, stance, swing)
+print(res)
 
 ### check the effect of exo assistance
-stanceswing_midstance = [0.5, 8.0, 8.2, 9.3, 11.0, 19.5, 36.7]    # Stance & Swing most affected
-stanceswing_Initial = [0.4,7.3,3.3,5.4,10.7,8.5,11.7]   # Stance & Swing most affected
+stanceswing_midstance = [0.5, 8.0, 8.2, 9.3, 11.0, 19.5, 36.7]      # Stance & Swing most affected
+stanceswing_Initial = [0.4,7.3,3.3,5.4,10.7,8.5,11.7]               # Stance & Swing most affected
 
-# Perform one-sample t-test
-t_stat, p_value, reject_null = one_sample_t_test(stanceswing_midstance, test_value=0, alpha=0.05)
-print(t_stat, p_value, reject_null)
+# # Perform one-sample t-test
+res = one_sample_t_test(stanceswing_midstance, test_value=0, alpha=0.05)
+results = normality_test(stanceswing_midstance)
+print(res)
 
-t_stat, p_value, reject_null = one_sample_t_test(stanceswing_Initial, test_value=0, alpha=0.05)
-print(t_stat, p_value, reject_null)
+res = one_sample_t_test(stanceswing_Initial, test_value=0, alpha=0.05)
+results = normality_test(stanceswing_Initial)
+print(res)
 
 stanceswing_midstance_less = [-6.2,5.2,5.6,8.9,8.6,6.9,11.5]    # Stance & Swing less affected
 stanceswing_Initial_less = [0.5,10.2,2.8,6.7,-2.1,8.8,19.3]   # Stance & Swing less affected
-t_stat, p_value, reject_null = one_sample_t_test(stanceswing_midstance_less, test_value=0, alpha=0.05)
-print(t_stat, p_value, reject_null)
+res = one_sample_t_test(stanceswing_midstance_less, test_value=0, alpha=0.05)
+results = normality_test(stanceswing_midstance_less)
+print(res)
+# # If p-value is less than 0.05, data is not normally distributed
+print("Data is not normally distributed. Performing the Wilcoxon Signed-Rank Test.")
+# Perform Wilcoxon Signed-Rank Test (comparing against a population mean of 0)
+stat, p_value = stats.wilcoxon(np.array(stanceswing_midstance_less) - 0)  # 0 is the hypothesized median
+print(f"Wilcoxon Signed-Rank Test p-value: {p_value}")
 
-t_stat, p_value, reject_null = one_sample_t_test(stanceswing_Initial_less, test_value=0, alpha=0.05)
-print(t_stat, p_value, reject_null)
+
+res = one_sample_t_test(stanceswing_Initial_less, test_value=0, alpha=0.05)
+results = normality_test(stanceswing_Initial_less)
+print(res)
 
 
-## ===========================================
-print('## ===========================================')
-print('## ===========================================')
-print('## ===========================================')
-import numpy as np
-from scipy.stats import shapiro, levene, ttest_rel, wilcoxon
+# ## ===========================================
+# print('## ===========================================')
+# print('## ===========================================')
+# print('## ===========================================')
+# import numpy as np
+# from scipy.stats import shapiro, levene, ttest_rel, wilcoxon
 
-def compare_twodata(data):
-    """
-    Compares the 'First' and 'Last' columns of multiple cases in the input data.
-    Performs normality tests, variance equality tests, and selects the appropriate statistical test.
+# def compare_twodata(data):
+#     """
+
+#     Compares the 'First' and 'Last' columns of multiple cases in the input data.
+#     Performs normality tests, variance equality tests, and selects the appropriate statistical test.
     
-    Parameters:
-        data (dict): Dictionary where each key is a case name and the values are dictionaries
-                     with 'First' and 'Last' columns as lists of numeric values.
+#     Parameters:
+#         data (dict): Dictionary where each key is a case name and the values are dictionaries
+#                      with 'First' and 'Last' columns as lists of numeric values.
                      
-    Returns:
-        dict: Results of statistical tests for each case (Shapiro-Wilk, Levene, t-test/Wilcoxon).
-    """
-    results = {}
+#     Returns:
+#         dict: Results of statistical tests for each case (Shapiro-Wilk, Levene, t-test/Wilcoxon).
+#     """
 
-    # Perform analysis for each case
-    for case, values in data.items():
-        first = np.array(values["First"])
-        last = np.array(values["Last"])
+#     results = {}
 
-        # Check normality using Shapiro-Wilk test
-        shapiro_first = shapiro(first).pvalue
-        shapiro_last = shapiro(last).pvalue
+#     # Perform analysis for each case
+#     for case, values in data.items():
+#         first = np.array(values["First"])
+#         last = np.array(values["Last"])
 
-        # Check variance equality using Levene's test if normality is assumed
-        if shapiro_first > 0.05 and shapiro_last > 0.05:
-            levene_pvalue = levene(first, last).pvalue
-            normal = True
-        else:
-            levene_pvalue = None
-            normal = False
+#         # Check normality using Shapiro-Wilk test
+#         shapiro_first = shapiro(first).pvalue
+#         shapiro_last = shapiro(last).pvalue
 
-        # Perform the appropriate test
-        if normal and levene_pvalue and levene_pvalue > 0.05:
-            # If both are normal and variances are equal, use paired t-test
-            test_stat, pvalue = ttest_rel(first, last)
-            test_used = "t-test"
-        else:
-            # If normality or variance equality is not met, use Wilcoxon signed-rank test
-            test_stat, pvalue = wilcoxon(first, last)
-            test_used = "Wilcoxon"
+#         # Check variance equality using Levene's test if normality is assumed
+#         if shapiro_first > 0.05 and shapiro_last > 0.05:
+#             levene_pvalue = levene(first, last).pvalue
+#             normal = True
+#         else:
+#             levene_pvalue = None
+#             normal = False
 
-        # Store results for each case
-        results[case] = {
-            "Shapiro First (p)": shapiro_first,
-            "Shapiro Last (p)": shapiro_last,
-            "Levene (p)": levene_pvalue,
-            "Test Used": test_used,
-            "Test Statistic": test_stat,
-            "p-value": pvalue
-        }
+#         # Perform the appropriate test
+#         if normal and levene_pvalue and levene_pvalue > 0.05:
+#             # If both are normal and variances are equal, use paired t-test
+#             test_stat, pvalue = ttest_rel(first, last)
+#             test_used = "t-test"
+#         else:
+#             # If normality or variance equality is not met, use Wilcoxon signed-rank test
+#             test_stat, pvalue = wilcoxon(first, last)
+#             test_used = "Wilcoxon"
 
-    # Print the results
-    results_df = pd.DataFrame(results).T
-    print(results_df)
-    return results
+#         # Store results for each case
+#         results[case] = {
+#             "Shapiro First (p)": shapiro_first,
+#             "Shapiro Last (p)": shapiro_last,
+#             "Levene (p)": levene_pvalue,
+#             "Test Used": test_used,
+#             "Test Statistic": test_stat,
+#             "p-value": pvalue
+#         }
 
-
-Midstance = {
-    "exoMidstanceMoreAffected": {
-        "First": [37.0, 10.6, 28.3, 28.0, 21.9, 17.9, 3.9],
-        "Last": [29.1, 11.3, 23.1, 22.9, 14.2, 13.2, -3.8]
-    },
-    "exoMidstanceLessAffected": {
-        "First": [31.0, 2.8, 14.8, 24.2, 15.3, -1.4, 2.4],
-        "Last": [33.4, -3.4, 18.5, 19.3, 11.5, 5.1, 0.4]
-    },
-    "baseMidstanceMoreAffected": {
-        "First": [31.4, 17.8, 26.5, 28.3, 42.6, 30.8, 23.8],
-        "Last": [29.7, 19.4, 31.4, 30.7, 25.2, 26.5, 35.8]
-    },
-    "baseMidstanceLessAffected": {
-        "First": [28.6, 6.1, 17.4, 25.2, 29.8, -2.6, 7.2],
-        "Last": [27.2, 1.8, 24.1, 27.4, 20.1, 2.5, 12.5]
-    }
-}
-
-# Call the function with the data
-results = compare_twodata(Midstance)
+#     # Print the results
+#     results_df = pd.DataFrame(results).T
+#     print(results_df)
+#     return results
 
 
-Initial = {
-    "exoInitialMoreAffected": {
-        "First": [39.7, 25.0, 34.1, 33.8, 35.4, 32.9, 33.6],
-        "Last": [31.2, 22.8, 33.5, 30.1, 27.5, 29.1, 41.1]
-    },
-    "exoInitialLessAffected": {
-        "First": [38.7, 8.7, 26.5, 37.6, 33.4, 24.8, 27.7],
-        "Last": [32.1, 11.1, 31.2, 26.2, 30.5, 34.5, 16.4]
-    },
-    "baseInitialMoreAffected": {
-        "First": [30.7, 29.0, 30.5, 29.2, 51.7, 49.7, 48.9],
-        "Last": [31.6, 30.1, 36.8, 33.7, 38.2, 46.1, 50.7]
-    },
-    "baseInitialLessAffected": {
-        "First": [31.0, 21.0, 25.2, 26.7, 44.2, 27.6, 26.8],
-        "Last": [32.5, 21.3, 33.9, 31.1, 28.4, 37.2, 27.8]
-    }
-}
+# Midstance = {
+#     "exoMidstanceMoreAffected": {
+#         "First": [37.0, 10.6, 28.3, 28.0, 21.9, 17.9, 3.9],
+#         "Last": [29.1, 11.3, 23.1, 22.9, 14.2, 13.2, -3.8]
+#     },
+#     "exoMidstanceLessAffected": {
+#         "First": [31.0, 2.8, 14.8, 24.2, 15.3, -1.4, 2.4],
+#         "Last": [33.4, -3.4, 18.5, 19.3, 11.5, 5.1, 0.4]
+#     },
+#     "baseMidstanceMoreAffected": {
+#         "First": [31.4, 17.8, 26.5, 28.3, 42.6, 30.8, 23.8],
+#         "Last": [29.7, 19.4, 31.4, 30.7, 25.2, 26.5, 35.8]
+#     },
+#     "baseMidstanceLessAffected": {
+#         "First": [28.6, 6.1, 17.4, 25.2, 29.8, -2.6, 7.2],
+#         "Last": [27.2, 1.8, 24.1, 27.4, 20.1, 2.5, 12.5]
+#     }
+# }
 
-# Call the function with the data
-results = compare_twodata(Initial)
-
-stepLength = {
-    "case1": {
-        "First": [0.05, 0.45, 0.18, 0.25, 0.22, 0.41, 0.28],
-        "Last": [0.09, 0.43, 0.35, 0.45, 0.28, 0.49, 0.34]
-    },
-    "case2": {
-        "First": [0.19, 0.39, 0.34, 0.47, 0.25, 0.46, 0.29],
-        "Last": [0.35, 0.43, 0.39, 0.57, 0.29, 0.49, 0.17]
-    },
-    "case3": {
-        "First": [0.30, 0.50, 0.30, 0.40, 0.30, 0.40, 0.40],
-        "Last": [0.30, 0.60, 0.30, 0.50, 0.30, 0.30, 0.30]
-    },
-    "case4": {
-        "First": [0.40, 0.50, 0.40, 0.60, 0.30, 0.40, 0.40],
-        "Last": [0.40, 0.50, 0.40, 0.60, 0.30, 0.40, 0.30]
-    }
-}
-results = compare_twodata(stepLength)
+# # Call the function with the data
+# results = compare_twodata(Midstance)
 
 
-gaitSpeed = {
-    "case1": {
-        "First": [0.16, 0.66, 0.48, 0.78, 0.42, 0.88, 0.52],
-        "Last": [0.37, 0.75, 0.73, 1.04, 0.57, 1.28, 0.40]
-    },
-    "case2": {
-        "First": [0.60, 1.00, 0.60, 1.00, 0.50, 0.80, 0.70],
-        "Last": [0.60, 0.90, 0.60, 1.10, 0.60, 0.80, 0.50]
-    }
-}
-results = compare_twodata(gaitSpeed)
+# Initial = {
+#     "exoInitialMoreAffected": {
+#         "First": [39.7, 25.0, 34.1, 33.8, 35.4, 32.9, 33.6],
+#         "Last": [31.2, 22.8, 33.5, 30.1, 27.5, 29.1, 41.1]
+#     },
+#     "exoInitialLessAffected": {
+#         "First": [38.7, 8.7, 26.5, 37.6, 33.4, 24.8, 27.7],
+#         "Last": [32.1, 11.1, 31.2, 26.2, 30.5, 34.5, 16.4]
+#     },
+#     "baseInitialMoreAffected": {
+#         "First": [30.7, 29.0, 30.5, 29.2, 51.7, 49.7, 48.9],
+#         "Last": [31.6, 30.1, 36.8, 33.7, 38.2, 46.1, 50.7]
+#     },
+#     "baseInitialLessAffected": {
+#         "First": [31.0, 21.0, 25.2, 26.7, 44.2, 27.6, 26.8],
+#         "Last": [32.5, 21.3, 33.9, 31.1, 28.4, 37.2, 27.8]
+#     }
+# }
 
+# # Call the function with the data
+# results = compare_twodata(Initial)
+
+# stepLength = {
+#     "case1": {
+#         "First": [0.05, 0.45, 0.18, 0.25, 0.22, 0.41, 0.28],
+#         "Last": [0.09, 0.43, 0.35, 0.45, 0.28, 0.49, 0.34]
+#     },
+#     "case2": {
+#         "First": [0.19, 0.39, 0.34, 0.47, 0.25, 0.46, 0.29],
+#         "Last": [0.35, 0.43, 0.39, 0.57, 0.29, 0.49, 0.17]
+#     },
+#     "case3": {
+#         "First": [0.30, 0.50, 0.30, 0.40, 0.30, 0.40, 0.40],
+#         "Last": [0.30, 0.60, 0.30, 0.50, 0.30, 0.30, 0.30]
+#     },
+#     "case4": {
+#         "First": [0.40, 0.50, 0.40, 0.60, 0.30, 0.40, 0.40],
+#         "Last": [0.40, 0.50, 0.40, 0.60, 0.30, 0.40, 0.30]
+#     }
+# }
+# results = compare_twodata(stepLength)
+
+
+# gaitSpeed = {
+#     "case1": {
+#         "First": [0.16, 0.66, 0.48, 0.78, 0.42, 0.88, 0.52],
+#         "Last": [0.37, 0.75, 0.73, 1.04, 0.57, 1.28, 0.40]
+#     },
+#     "case2": {
+#         "First": [0.60, 1.00, 0.60, 1.00, 0.50, 0.80, 0.70],
+#         "Last": [0.60, 0.90, 0.60, 1.10, 0.60, 0.80, 0.50]
+#     }
+# }
+# results = compare_twodata(gaitSpeed)
 
